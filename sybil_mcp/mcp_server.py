@@ -134,23 +134,21 @@ def chat(req: ChatRequest):
     print(f"Parsed [todo: ...] tags: {todo_tags}")
     # Web search tool logic
     web_plugin = PLUGINS.get("web_search")
-    web_tag = re.search(r"\[web:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
-    if web_plugin and web_tag:
-        web_query = web_tag.group(1).strip()
-        print(f"[WEB DEBUG] Sybil is searching the web for: {web_query}")
-        # Optionally, return a 'searching...' message for realism
-        searching_msg = "Sybil is searching the web..."
-        # Actually perform the web search
-        web_result = web_plugin.search_web(web_query, user_id=req.user_id)
-        print(f"[WEB DEBUG] Web result: {web_result}")
-        # Insert the web result as a system message and re-call the LLM
-        web_context = {"role": "system", "content": f"Web search result for '{web_query}': {web_result}"}
-        # Remove the [web: ...] tag from the LLM reply for the next round
+    web_tags = re.findall(r"\[web:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
+    if web_plugin and web_tags:
+        web_contexts = []
+        for web_query in web_tags:
+            web_query = web_query.strip()
+            print(f"[WEB DEBUG] Sybil is searching the web for: {web_query}")
+            web_result = web_plugin.search_web(web_query, user_id=req.user_id)
+            print(f"[WEB DEBUG] Web result: {web_result}")
+            web_contexts.append({"role": "system", "content": f"Web search result for '{web_query}': {web_result}\nYou should reference the source(s) above in your answer if relevant."})
+        # Remove all [web: ...] tags from the LLM reply for the next round
         llm_reply_clean = re.sub(r"^\[web: .+?\]$", "", llm_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
-        # Add the web context and the cleaned LLM reply to the message history
-        message_history.append(web_context)
+        # Add all web contexts and the cleaned LLM reply to the message history
+        message_history.extend(web_contexts)
         message_history.append({"role": "assistant", "content": llm_reply_clean})
-        # Re-call the LLM so it can use the web result
+        # Re-call the LLM so it can use all web results
         try:
             response2 = openai.ChatCompletion.create(
                 model=model,
@@ -332,15 +330,15 @@ def chat(req: ChatRequest):
     is_list_display = ("to-do list" in lower_reply or "todo list" in lower_reply or "here is your" in lower_reply or "here's your" in lower_reply)
     if is_action and not tool_triggered:
         todo_confirmation += "\n⚠️ Sorry, I couldn't update your to-do list because the action wasn't properly triggered. Please try again or use the /todo menu."
-    # Always overwrite any list display in the LLM's reply with the real, up-to-date list from the plugin
-    if is_list_display:
+    # Only overwrite with the raw to-do list if the user's message is an explicit request
+    explicit_show_todo = any(kw in req.message.lower() for kw in ["show my todo list", "show me my todo list", "what's on my todo list", "list my todos", "list my to-dos", "show todo list", "show to-do list"])
+    if explicit_show_todo:
         todos = todo_plugin.get_todo_list(req.user_id)
         if todos:
             todo_lines = [f"{i+1}. {'✅' if t['done'] else '❌'} {t['task']}" for i, t in enumerate(todos)]
             text_reply = "Here's your to-do list:\n" + "\n".join(todo_lines)
         else:
             text_reply = "Your to-do list is empty."
-        # If showing the list, do NOT append any plugin confirmation or extra text
         return {"text": text_reply, "image_url": "", "image_prompt": None}
     # Check for [image: ...] in the LLM response
     image_match = re.search(r"^\[image: (.+)\]$", llm_reply.strip(), re.IGNORECASE | re.MULTILINE)
