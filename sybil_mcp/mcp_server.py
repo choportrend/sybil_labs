@@ -60,6 +60,16 @@ SYSTEM_PROMPT = (
     "If you need up-to-date information from the internet, or the user asks a question that requires a web search, output a [web: ...] tag on a new line with the search query. "
     "For example, if the user says 'What's the latest news about AI?', you might write: [web: latest news about AI]. "
     "After the web result is provided, use it to answer the user's question naturally, as if you just knew the information."
+    "For all note actions, you MUST ALWAYS use a [note: ...] tag. This is MANDATORY and NON-NEGOTIABLE. "
+    "Examples of REQUIRED tags for each action: "
+    "- To add a note: [note: add Call Alice about the contract] "
+    "- To list notes: [note: list] "
+    "- To search notes: [note: search Project X] "
+    "- To show a note: [note: show 2] (where 2 is the note number) "
+    "- To remove a note: [note: remove 3] "
+    "Even if the user asks in natural language like 'take a note', 'show my notes', or 'remove the third note', you MUST output the corresponding [note: ...] tag. "
+    "If you do not use a [note: ...] tag, the user's notes will NOT be updated. Never confirm an action unless you have output the correct tag. "
+    "ALWAYS confirm the action in your reply, e.g. 'Noted: ...', 'Here are your notes: ...', 'Removed note 1.', etc. "
 )
 
 class ChatRequest(BaseModel):
@@ -131,7 +141,9 @@ def chat(req: ChatRequest):
     print(f"User: {req.user_id}")
     print(f"LLM raw output:\n{llm_reply}")
     todo_tags = re.findall(r"\[todo:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
+    note_tags = re.findall(r"\[note:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
     print(f"Parsed [todo: ...] tags: {todo_tags}")
+    print(f"Parsed [note: ...] tags: {note_tags}")
     # Web search tool logic
     web_plugin = PLUGINS.get("web_search")
     web_tags = re.findall(r"\[web:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
@@ -164,7 +176,9 @@ def chat(req: ChatRequest):
     print("--- END DEBUG ---\n")
     # Tool triggers (robust parsing)
     todo_plugin = PLUGINS.get("todo")
+    notes_plugin = PLUGINS.get("notes")
     todo_confirmation = ""
+    note_confirmation = ""
     tool_triggered = False
     action_words = ["add", "added", "remove", "removed", "mark", "marked", "done", "complete", "completed", "unmark", "unmarked", "not done"]
     undone_fallback_triggered = False
@@ -241,8 +255,38 @@ def chat(req: ChatRequest):
                     tool_triggered = True
                     undone_fallback_triggered = True
                     print(f"FALLBACK TRIGGERED: undone {idx}")
-    # Remove all [todo: ...] tags from the reply
+    # Notes tool triggers
+    if notes_plugin:
+        for tag in note_tags:
+            tag = tag.strip()
+            if tag.lower().startswith("add "):
+                result = notes_plugin.handle_note("add", req.user_id, tag[4:].strip())
+                print(f"[NOTES DEBUG] add: {tag[4:].strip()} | result: {result}")
+                note_confirmation += f"\n{result}"
+                tool_triggered = True
+            elif tag.lower() == "list":
+                result = notes_plugin.handle_note("list", req.user_id)
+                print(f"[NOTES DEBUG] list | result: {result}")
+                note_confirmation += f"\n{result}"
+                tool_triggered = True
+            elif tag.lower().startswith("search "):
+                result = notes_plugin.handle_note("search", req.user_id, tag[7:].strip())
+                print(f"[NOTES DEBUG] search: {tag[7:].strip()} | result: {result}")
+                note_confirmation += f"\n{result}"
+                tool_triggered = True
+            elif tag.lower().startswith("show "):
+                result = notes_plugin.handle_note("show", req.user_id, tag[5:].strip())
+                print(f"[NOTES DEBUG] show: {tag[5:].strip()} | result: {result}")
+                note_confirmation += f"\n{result}"
+                tool_triggered = True
+            elif tag.lower().startswith("remove "):
+                result = notes_plugin.handle_note("remove", req.user_id, tag[7:].strip())
+                print(f"[NOTES DEBUG] remove: {tag[7:].strip()} | result: {result}")
+                note_confirmation += f"\n{result}"
+                tool_triggered = True
+    # Remove all [todo: ...] and [note: ...] tags from the reply
     text_reply = re.sub(r"^\[todo: .+?\]$", "", llm_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
+    text_reply = re.sub(r"^\[note: .+?\]$", "", text_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
 
     # Helper: does LLM reply already confirm the action?
     def llm_confirms_action(action_type, idx_or_task=None):
@@ -328,7 +372,12 @@ def chat(req: ChatRequest):
     lower_reply = text_reply.lower()
     is_action = any(word in lower_reply for word in action_words)
     is_list_display = ("to-do list" in lower_reply or "todo list" in lower_reply or "here is your" in lower_reply or "here's your" in lower_reply)
-    if is_action and not tool_triggered:
+    # Only show the to-do warning if the LLM reply is about the to-do list
+    is_todo_context = (
+        "to-do list" in lower_reply or "todo list" in lower_reply or
+        "task" in lower_reply or "tasks" in lower_reply
+    )
+    if is_action and not tool_triggered and is_todo_context:
         todo_confirmation += "\n⚠️ Sorry, I couldn't update your to-do list because the action wasn't properly triggered. Please try again or use the /todo menu."
     # Only overwrite with the raw to-do list if the user's message is an explicit request
     explicit_show_todo = any(kw in req.message.lower() for kw in ["show my todo list", "show me my todo list", "what's on my todo list", "list my todos", "list my to-dos", "show todo list", "show to-do list"])
@@ -341,14 +390,15 @@ def chat(req: ChatRequest):
             text_reply = "Your to-do list is empty."
         return {"text": text_reply, "image_url": "", "image_prompt": None}
     # Check for [image: ...] in the LLM response
-    image_match = re.search(r"^\[image: (.+)\]$", llm_reply.strip(), re.IGNORECASE | re.MULTILINE)
+    image_match = re.search(r"\[image: (.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
     image_url = ""
     image_prompt = None
     # Fallback: detect image intent and creative description if no [image: ...] tag
     user_message = req.message.lower()
-    image_intent_words = ["image", "draw", "depict", "visualize", "picture", "illustrate", "show me", "make me an image", "generate an image"]
+    image_intent_words = ["draw", "depict", "visualize", "picture", "illustrate", "show me a picture", "make me an image", "generate an image"]
     creative_starts = ["imagine", "picture", "visualize", "envision", "a scene", "a depiction", "a creative representation", "a surreal", "a whimsical", "a vibrant", "a collage", "an illustration"]
     def has_image_intent(msg):
+        msg = msg.lower()
         return any(word in msg for word in image_intent_words)
     def extract_creative_description(reply):
         # Look for a paragraph or sentence that starts with a creative word
@@ -362,17 +412,20 @@ def chat(req: ChatRequest):
             return sentences[0]
         return None
     if image_match:
-        prompt = image_match.group(1)
-        image_prompt = prompt
-        plugin = PLUGINS.get("image_gen")
-        if not plugin:
-            return {"text": "Image generation plugin not loaded.", "image_url": "", "image_prompt": None}
-        try:
-            image_url = plugin.generate_image(prompt, user_id=req.user_id) or ""
-        except Exception as e:
-            return {"text": f"Error generating image: {e}", "image_url": "", "image_prompt": image_prompt}
-        # Remove the [image: ...] tag and any prompt from the conversational reply
-        text_reply = re.sub(r"^\[image: .+?\]$", "", text_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
+        prompt = image_match.group(1).strip()
+        if prompt:
+            image_prompt = prompt
+            plugin = PLUGINS.get("image_gen")
+            if not plugin:
+                return {"text": "Image generation plugin not loaded.", "image_url": "", "image_prompt": None}
+            try:
+                image_url = plugin.generate_image(prompt, user_id=req.user_id) or ""
+            except Exception as e:
+                return {"text": f"Error generating image: {e}", "image_url": "", "image_prompt": image_prompt}
+            # Remove the [image: ...] tag and any prompt from the conversational reply
+            text_reply = re.sub(r"\[image: .+?\]", "", text_reply, flags=re.IGNORECASE | re.DOTALL).strip()
+        else:
+            return {"text": "Sorry, I couldn't generate an image because the prompt was empty. Please try rephrasing your request.", "image_url": "", "image_prompt": None}
     elif has_image_intent(user_message):
         # Only trigger fallback if no [image: ...] tag
         creative_desc = extract_creative_description(llm_reply)
@@ -385,10 +438,15 @@ def chat(req: ChatRequest):
                 image_url = plugin.generate_image(image_prompt, user_id=req.user_id) or ""
             except Exception as e:
                 return {"text": f"Error generating image: {e}", "image_url": "", "image_prompt": image_prompt}
+        else:
+            return {"text": "Sorry, I couldn't generate an image this time. Please try rephrasing your request.", "image_url": "", "image_prompt": None}
     # Store assistant response in context
     history.append({"role": "assistant", "content": llm_reply})
     USER_CONTEXT[req.user_id] = history
-    return {"text": (text_reply if text_reply else "") + ("" if suppress_confirmation else todo_confirmation), "image_url": image_url, "image_prompt": image_prompt}
+    final_text = ((text_reply or "") + (note_confirmation or "") + ("" if suppress_confirmation else todo_confirmation)).strip()
+    if not final_text:
+        final_text = "I'm not sure what you wanted to do. Please try again or rephrase your request."
+    return {"text": final_text, "image_url": image_url, "image_prompt": image_prompt}
 
 @app.post("/reset_context")
 def reset_context(req: UserRequest):
