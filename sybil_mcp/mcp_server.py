@@ -56,7 +56,10 @@ SYSTEM_PROMPT = (
     "If you do not use a [todo: ...] tag, the user's list will NOT be updated. Never confirm an action unless you have output the correct tag. "
     "ALWAYS use emoji (✅ for done, ❌ for not done) for to-do list formatting. "
     "ALWAYS confirm the action in your reply, e.g. 'Added to your to-do list: buy milk.' or 'Here is your to-do list: ...' or 'Marked task 2 as done.' or 'Removed task 1.' "
-    "For all other requests, respond normally."
+    "For all other requests, respond normally. "
+    "If you need up-to-date information from the internet, or the user asks a question that requires a web search, output a [web: ...] tag on a new line with the search query. "
+    "For example, if the user says 'What's the latest news about AI?', you might write: [web: latest news about AI]. "
+    "After the web result is provided, use it to answer the user's question naturally, as if you just knew the information."
 )
 
 class ChatRequest(BaseModel):
@@ -129,6 +132,37 @@ def chat(req: ChatRequest):
     print(f"LLM raw output:\n{llm_reply}")
     todo_tags = re.findall(r"\[todo:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
     print(f"Parsed [todo: ...] tags: {todo_tags}")
+    # Web search tool logic
+    web_plugin = PLUGINS.get("web_search")
+    web_tag = re.search(r"\[web:\s*(.+?)\]", llm_reply, re.IGNORECASE | re.DOTALL)
+    if web_plugin and web_tag:
+        web_query = web_tag.group(1).strip()
+        print(f"[WEB DEBUG] Sybil is searching the web for: {web_query}")
+        # Optionally, return a 'searching...' message for realism
+        searching_msg = "Sybil is searching the web..."
+        # Actually perform the web search
+        web_result = web_plugin.search_web(web_query, user_id=req.user_id)
+        print(f"[WEB DEBUG] Web result: {web_result}")
+        # Insert the web result as a system message and re-call the LLM
+        web_context = {"role": "system", "content": f"Web search result for '{web_query}': {web_result}"}
+        # Remove the [web: ...] tag from the LLM reply for the next round
+        llm_reply_clean = re.sub(r"^\[web: .+?\]$", "", llm_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
+        # Add the web context and the cleaned LLM reply to the message history
+        message_history.append(web_context)
+        message_history.append({"role": "assistant", "content": llm_reply_clean})
+        # Re-call the LLM so it can use the web result
+        try:
+            response2 = openai.ChatCompletion.create(
+                model=model,
+                messages=message_history
+            )
+            llm_reply2 = response2["choices"][0]["message"]["content"]
+        except Exception as e:
+            return {"text": f"Error after web search: {e}", "image_url": "", "image_prompt": None}
+        # Store assistant response in context
+        history.append({"role": "assistant", "content": llm_reply2})
+        USER_CONTEXT[req.user_id] = history
+        return {"text": llm_reply2, "image_url": "", "image_prompt": None}
     print("--- END DEBUG ---\n")
     # Tool triggers (robust parsing)
     todo_plugin = PLUGINS.get("todo")
@@ -312,6 +346,23 @@ def chat(req: ChatRequest):
     image_match = re.search(r"^\[image: (.+)\]$", llm_reply.strip(), re.IGNORECASE | re.MULTILINE)
     image_url = ""
     image_prompt = None
+    # Fallback: detect image intent and creative description if no [image: ...] tag
+    user_message = req.message.lower()
+    image_intent_words = ["image", "draw", "depict", "visualize", "picture", "illustrate", "show me", "make me an image", "generate an image"]
+    creative_starts = ["imagine", "picture", "visualize", "envision", "a scene", "a depiction", "a creative representation", "a surreal", "a whimsical", "a vibrant", "a collage", "an illustration"]
+    def has_image_intent(msg):
+        return any(word in msg for word in image_intent_words)
+    def extract_creative_description(reply):
+        # Look for a paragraph or sentence that starts with a creative word
+        for line in reply.split("\n"):
+            l = line.strip().lower()
+            if any(l.startswith(start) for start in creative_starts):
+                return line.strip()
+        # Fallback: look for a long, vivid sentence
+        sentences = [s.strip() for s in reply.split(".") if len(s.strip().split()) > 7]
+        if sentences:
+            return sentences[0]
+        return None
     if image_match:
         prompt = image_match.group(1)
         image_prompt = prompt
@@ -322,6 +373,20 @@ def chat(req: ChatRequest):
             image_url = plugin.generate_image(prompt, user_id=req.user_id) or ""
         except Exception as e:
             return {"text": f"Error generating image: {e}", "image_url": "", "image_prompt": image_prompt}
+        # Remove the [image: ...] tag and any prompt from the conversational reply
+        text_reply = re.sub(r"^\[image: .+?\]$", "", text_reply, flags=re.IGNORECASE | re.MULTILINE).strip()
+    elif has_image_intent(user_message):
+        # Only trigger fallback if no [image: ...] tag
+        creative_desc = extract_creative_description(llm_reply)
+        if creative_desc:
+            image_prompt = creative_desc
+            plugin = PLUGINS.get("image_gen")
+            if not plugin:
+                return {"text": "Image generation plugin not loaded.", "image_url": "", "image_prompt": None}
+            try:
+                image_url = plugin.generate_image(image_prompt, user_id=req.user_id) or ""
+            except Exception as e:
+                return {"text": f"Error generating image: {e}", "image_url": "", "image_prompt": image_prompt}
     # Store assistant response in context
     history.append({"role": "assistant", "content": llm_reply})
     USER_CONTEXT[req.user_id] = history
